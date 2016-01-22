@@ -1,26 +1,11 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
-#
-# File: cnn_sentence.py
-# @Author: Allen Nie
-# @Original: https://github.com/yoonkim/CNN_sentence/blob/master/conv_net_sentence.py
-# @created: 15 Nov 2015
-#
-# ===============================================================================
-# DESCRIPTION:
-#
-# takes in IMDB data processed by imdb_preprocess_data.py
-#
-# ===============================================================================
-# CURRENT STATUS: fixing adversarial
-# ===============================================================================
-# USAGE:
-#  python cnn_sentence.py -nonstatic
-# ===============================================================================
-
+"""
+Replica of https://github.com/yoonkim/CNN_sentence/blob/master/conv_net_sentence.py
+"""
 
 import cPickle as pkl
 import os
+
+import errno
 import numpy as np
 import sys
 import warnings
@@ -30,14 +15,19 @@ from collections import defaultdict, OrderedDict
 import numpy
 import theano
 import theano.tensor as T
+from theano import pp
 from theano.tensor.nnet import conv
-from net_layers_classes import LeNetConvPoolLayer, MLPDropout
+from cnn_net_layers_classes import LeNetConvPoolLayer, MLPDropout
+import argparse
+import subprocess  # for printing to both std and log file
 
 warnings.filterwarnings("ignore")
 
 # Set the random number generators' seeds for consistency
 SEED = 3435
 numpy.random.seed(SEED)
+
+LOG_FILE = None
 
 
 def ReLU(x):
@@ -59,6 +49,86 @@ def Iden(x):
     y = x
     return (y)
 
+
+# ============ Util function ==========
+
+def init_log(prefix, LOG_FILE_LOC):
+    """
+    Initialize logging file (keep it open)
+    :return:
+    """
+    global LOG_FILE
+    if LOG_FILE_LOC is not None:
+        if not os.path.exists(os.path.dirname(LOG_FILE_LOC)):
+            try:
+                os.makedirs(os.path.dirname(LOG_FILE_LOC))
+            except OSError as exc:  # Guard against race condition
+                if exc.errno != errno.EEXIST:
+                    raise
+
+        # then we open/create that file
+        LOG_FILE = open(prefix + "/" + LOG_FILE_LOC, 'wb')
+    else:
+        print "Writing log to stdout!"
+
+
+def close_log():
+    """
+    Call this at the end of file to close log
+    :return:
+    """
+    if LOG_FILE is not None:
+        LOG_FILE.close()
+
+
+def log(sent):
+    print(sent)
+    if LOG_FILE is not None:
+        LOG_FILE.write(repr(sent) + " \n")
+
+
+# ============= Parameters Getting ========
+
+def get_args():
+    """
+    parses command line args"""
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--prefix', dest='PREFIX', type=str,
+                        default='/Users/Aimingnie/Documents/School/Stanford/CS 224N/DeepLearning/dataset/',
+                        help='path containing trailing /')
+    parser.add_argument('--data', dest='DATAPATH', type=str,
+                        default="imdb_lstm.pkl",
+                        help="mostly it's a file named 'imdb_lstm.pkl', provide the abs path")
+    parser.add_argument('--idxmap', dest='IDX_MAP_PATH', type=str,
+                        default="imdb_lstm.idxmap.pkl",
+                        help="this mostly is a file named 'imdb_lstm.idxmap.pkl', provide the abs path")
+
+    parser.add_argument('--epochs', dest='N_EPOCHS', type=int, default=100)
+
+    # ADVERSARIAL_EPSILON = .07
+    # this CNN program doesn't have ADV_ALPHA. ADV_ALPHA is fixed by the learning rate
+    # of the entire algorithm
+    parser.add_argument('--adv_eps', dest='ADVERSARIAL_EPSILON', type=float, default=0.5)
+    parser.add_argument('--adv_lr', dest='ADVERSARIAL_ALPHA', type=float, default=0.25)
+
+    parser.add_argument('--adv', dest='ADVERSARIAL', action='store_true',
+                        help="by default is set to 0 (false).  Running with --adv 1 flag sets it to true.")
+
+    # learning rate for sgd, as well as adversarial
+    parser.add_argument("--lr_decay", dest='LRDECAY', type=float, default=0.95)
+    parser.add_argument("--maxlen", dest='MAXLEN', type=int, default=100,
+                        help="the maximum length of words we'll take into account for each paragraph")
+    parser.add_argument("--batchsize", dest='BATCHSIZE', type=int, default=16)
+
+    # redirect writing streams
+    parser.add_argument("--logfile", dest='LOG_FILE_LOC', type=str,
+                        help="Specify the location of the output file")
+
+    return parser.parse_args()
+
+
+# ============= End ============
 
 def get_layers(rng, x, y, Words, filter_hs, filter_shapes, pool_sizes,
                batch_size, img_h, img_w, conv_non_linear,
@@ -131,19 +201,13 @@ def get_layers(rng, x, y, Words, filter_hs, filter_shapes, pool_sizes,
     params = classifier.params
     for conv_layer in conv_layers:
         params += conv_layer.params
+
     # if non_static:
     #     # !!if word vectors are allowed to change, add them as model parameters
     #     # this is interesting...
     #     params += [Words]
 
-    cost = classifier.negative_log_likelihood(y)
-    # dropout_cost is from the LAST drop_out layer
-    dropout_cost = classifier.dropout_negative_log_likelihood(y)
-
-    # here, we determine WHAT to return!!!!
-    # and see if model trains normally
-
-    return classifier, conv_layers, params, cost, dropout_cost
+    return classifier, conv_layers, params
 
 
 def train_conv_net(datasets,
@@ -162,6 +226,7 @@ def train_conv_net(datasets,
                    sqr_norm_lim=9,
                    non_static=True,
                    adversarial=True,
+                   adv_lr_rate=0.1,
                    adv_epsilon=0.25):
     """
     couple of modifications:
@@ -211,12 +276,13 @@ def train_conv_net(datasets,
         # is   0.56, 0.44 ...
         pool_sizes.append((img_h - filter_h + 1, img_w - filter_w + 1))
 
-    parameters = [("image shape", img_h, img_w), ("filter shape", filter_shapes), ("hidden_units", hidden_units),
+    parameters = [("adversarial", adversarial), ("adv_lr_rate", adv_lr_rate), ("adv_epsilon", adv_epsilon),
+                  ("image shape", img_h, img_w), ("filter shape", filter_shapes), ("hidden_units", hidden_units),
                   ("dropout", dropout_rate), ("batch_size", batch_size), ("non_static", non_static),
                   ("learn_decay", lr_decay), ("conv_non_linear", conv_non_linear),
                   ("non_static", non_static), ("sqr_norm_lim", sqr_norm_lim), ("shuffle_batch", shuffle_batch)]
 
-    print parameters
+    log(parameters)
 
     # define model architecture
     index = T.lscalar()
@@ -242,39 +308,44 @@ def train_conv_net(datasets,
 
     # this is very bulky right now
     # because you don't have enough knowledge on Theano......
-    classifier, conv_layers, params, cost, dropout_cost = get_layers(rng, x, y, Words,
-                                                                     filter_hs, filter_shapes,
-                                                                     pool_sizes, batch_size,
-                                                                     img_h, img_w, conv_non_linear,
-                                                                     hidden_units, feature_maps,
-                                                                     activations, dropout_rate, non_static)
-
-    # we generate adversarial examples on normal cost
-    # but we optimize on dropout_cost
-
-    if adversarial:
-        leaf_grads = theano.tensor.grad(cost, wrt=Words)  # we need to wrt word embedding Words (by Jon Gauthier)
-        anti_example = theano.tensor.sgn(leaf_grads)
-        adv_example = Words + adv_epsilon * anti_example  # lol, I strongly don't think this is "savable" by any means
-        adv_example_grad = theano.gradient.disconnected_grad(
-            adv_example)  # I think this is the J(theta, x + eta * sgn(partial-derivative on x over J(theta, x, y)))
-
-        # instead of Words, we drop in adv_example
-        # so both cost, and dropout_cost should be updated
-
-        # but we are not replacing others...
-        _, _, _, cost, dropout_cost = get_layers(rng, x, y, adv_example,
+    classifier, conv_layers, params = get_layers(rng, x, y, Words,
                                                  filter_hs, filter_shapes,
                                                  pool_sizes, batch_size,
                                                  img_h, img_w, conv_non_linear,
                                                  hidden_units, feature_maps,
                                                  activations, dropout_rate, non_static)
 
-        cost = lr_decay * cost + (1 - lr_decay) * adv_example_grad  # formula on paper
+    cost = classifier.negative_log_likelihood(y)
+    # dropout_cost is from the LAST drop_out layer
+    dropout_cost = classifier.dropout_negative_log_likelihood(y)
+
+    # we generate adversarial examples on normal cost
+    # but we optimize on dropout_cost
+
+    if adversarial:
+        leaf_grads = theano.tensor.grad(cost, wrt=Words)
+        # we need to wrt word embedding Words (by Jon Gauthier)
+        anti_example = theano.tensor.sgn(leaf_grads)
+        adv_example = Words + adv_epsilon * anti_example  # lol, I strongly don't think this is "savable" by any means
+
+        # below two lines aren't quite working
+        # the cost calculated by that is not a scalar, thus can't be updated
+
+        adv_example_grad = theano.gradient.disconnected_grad(
+            adv_example)  # I think this is the J(theta, x + eta * sgn(partial-derivative on x over J(theta, x, y)))
+
+        # instead of Words, we drop in adv_example
+        # so both cost, and dropout_cost should be updated
+
+        cost = adv_lr_rate * cost + (1 - adv_lr_rate) * T.sum(adv_example_grad)  # formula on paper
         # cost is a scalar, but apparently, adv_example_grad IS NOT!!!!!
         # This is the PROBLEM
 
-    grad_updates = sgd_updates_adadelta(params, dropout_cost, lr_decay, 1e-6, sqr_norm_lim)
+        grad_updates = sgd_updates_adadelta(params, cost, lr_decay, 1e-6, sqr_norm_lim)
+
+    else:
+
+        grad_updates = sgd_updates_adadelta(params, dropout_cost, lr_decay, 1e-6, sqr_norm_lim)
 
     # datasets[0] is the training sample
     # instead of original's manual numpy permutation
@@ -284,9 +355,9 @@ def train_conv_net(datasets,
     n_val_batches = int(np.round(valid_set_x.shape[0] / batch_size))
     n_test_batches = int(np.round(test_set_x.shape[0] / batch_size))
 
-    print "%d train examples" % train_set_x.shape[0]
-    print "%d valid examples" % valid_set_x.shape[0]
-    print "%d test examples" % test_set_x.shape[0]
+    log("%d train examples" % train_set_x.shape[0])
+    log("%d valid examples" % valid_set_x.shape[0])
+    log("%d test examples" % test_set_x.shape[0])
 
     # sys.exit(0)
 
@@ -333,7 +404,7 @@ def train_conv_net(datasets,
 
     # start training over mini-batches
 
-    print '... training'
+    log('... training')
 
     patience = 1000  # look as this many examples regardless
     patience_increase = 2  # wait this much longer when a new best is
@@ -344,8 +415,8 @@ def train_conv_net(datasets,
     epoch = 0
     best_iter = 0
     best_val_perf = 0
-    val_perf = 0
-    test_perf = 0
+    val_perf = []
+    test_perf = []
     cost_epoch = 0
 
     # early stop
@@ -376,15 +447,17 @@ def train_conv_net(datasets,
                 set_zero(zero_vec)  # hmmmmm, what's this doing??
 
                 if iter % 100 == 0:
-                    print('training @ iter = ', iter)
+                    log('training @ iter = %d' % iter)
 
                 if (iter + 1) % validFreq == 0:
                     validation_losses = [val_model(i) for i
                                          in range(n_val_batches)]
                     this_validation_loss = np.mean(validation_losses)
-                    print('epoch %i, minibatch %i/%i, validation error %f %%' %
+                    log('epoch %i, minibatch %i/%i, validation error %f %%' %
                           (epoch, minibatch_index + 1, n_train_batches,
                            this_validation_loss * 100.))
+
+                    val_perf.append(this_validation_loss)
 
                     # if we got the best validation score until now
                     if this_validation_loss < best_validation_loss:
@@ -395,6 +468,8 @@ def train_conv_net(datasets,
 
                         # save best validation score and iteration number
                         best_validation_loss = this_validation_loss
+
+                        best_val_perf = 1 - np.mean(best_validation_loss)
                         best_iter = iter
 
                         # test it on the test set
@@ -403,10 +478,12 @@ def train_conv_net(datasets,
                             for i in range(n_test_batches)
                             ]
                         test_score = np.mean(test_losses)
-                        print(('     epoch %i, minibatch %i/%i, test error of '
+                        log(('     epoch %i, minibatch %i/%i, test error of '
                                'best model %f %%') %
                               (epoch, minibatch_index + 1, n_train_batches,
                                test_score * 100.))
+
+                        test_perf.append(test_score)
 
                 if patience <= iter:
                     done_looping = True
@@ -416,11 +493,17 @@ def train_conv_net(datasets,
 
     end_time = timeit.default_timer()
 
-    print('Optimization complete.')
-    print('Best validation score of %f %% obtained at epoch %i, '
+    test_losses = [
+        test_model(i)
+        for i in range(n_test_batches)
+        ]
+    final_test_score = np.mean(test_losses)
+
+    log('Optimization complete.')
+    log('Best validation score of %f %% obtained at epoch %i, '
           'with test performance %f %%' %
-          (best_val_perf * 100., best_iter, test_perf * 100.))
-    print('The code for file ' +
+          (best_val_perf * 100., best_iter, final_test_score * 100.))
+    log('The code for file ' +
           os.path.split(__file__)[1] +
           ' ran for %.2fm' % ((end_time - start_time) / 60.))
 
@@ -581,7 +664,7 @@ def sentence_filtering(train_set, maxlen):
     return train_set
 
 
-def sentence_clipping(sentence_set, maxLen=100):
+def sentence_clipping(sentence_set, maxLen=200):
     """
     This clips the sentence to a max length
     originally length 2000 something is too slow to train on
@@ -663,46 +746,60 @@ def load_idx_map(path):
 
 
 if __name__ == '__main__':
-    print "loading data..."
-    DATAPATH = "/Users/Aimingnie/Documents/School/Stanford/CS 224N/DeepLearning/dataset/" \
-               "imdb_lstm.pkl"
+    ARGS = get_args()
 
-    IDX_MAP_PATH = "/Users/Aimingnie/Documents/School/Stanford/CS 224N/DeepLearning/dataset/" \
-                   "imdb_lstm.idxmap.pkl"
+    pwd = os.path.dirname(os.path.realpath(__file__))
+
+    print("initializing logs...")
+    init_log(pwd, ARGS.LOG_FILE_LOC)
+
+    log("loading data...")
+    DATAPATH = ARGS.PREFIX + ARGS.DATAPATH
+
+    IDX_MAP_PATH = ARGS.IDX_MAP_PATH
 
     train, valid, test = load_data(DATAPATH,
                                    valid_portion=0.1,
                                    filter_h=5,
-                                   maxlen=100)
-    word_emb, word_idx_map = load_idx_map(IDX_MAP_PATH)
+                                   maxlen=ARGS.MAXLEN)
+    word_emb, word_idx_map = load_idx_map(ARGS.PREFIX + IDX_MAP_PATH)
 
-    print "data loaded!"
+    log("data loaded!")
 
-    mode = sys.argv[1]
-    non_static = True
+    # mode = sys.argv[1]
+    non_static = False
 
-    if mode == "-nonstatic":
-        print "model architecture: CNN-non-static"
-        non_static = True
-    elif mode == "-static":
-        print "model architecture: CNN-static"
-        non_static = False
-
-    execfile("net_layers_classes.py")
+    # if mode == "-nonstatic":
+    #     print "model architecture: CNN-non-static"
+    #     non_static = True
+    # elif mode == "-static":
+    #     print "model architecture: CNN-static"
+    #     non_static = False
+    execfile(pwd + "/cnn_net_layers_classes.py")
 
     # instead of cross-validation of 10-fold
     # We do a straight forward validation
     train_conv_net([train, valid, test],
                    word_emb,  # same as W
-                   lr_decay=0.95,
+                   lr_decay=ARGS.LRDECAY,
+                   # this is the "rho" value for adadelta, lr for adadelta is always 1.0, default = 0.95
                    filter_hs=[3, 4, 5],
                    conv_non_linear="relu",
                    hidden_units=[100, 2],
                    shuffle_batch=True,
-                   n_epochs=150,
-                   sqr_norm_lim=9,
+                   n_epochs=ARGS.N_EPOCHS,
+                   sqr_norm_lim=9,  # this is an adadelta parameter
                    non_static=non_static,
-                   batch_size=16,
-                   dropout_rate=[0.5],
-                   adversarial=True,
-                   adv_epsilon=0.25)
+                   batch_size=ARGS.BATCHSIZE,
+                   dropout_rate=[0.5],  # if we are using adv, we aren't optimizing based on drop_out cost
+                   adversarial=ARGS.ADVERSARIAL,
+                   adv_lr_rate=ARGS.ADVERSARIAL_ALPHA,  # learning rate for adversarial
+                   adv_epsilon=ARGS.ADVERSARIAL_EPSILON)
+
+    # proposal: what if we do this kind of random search
+    # that we start a trial, original CNN runs on one set of params,
+    # adv programs try a whole range of params and see if it can beat original CNN
+    # obviously one thing it won't control is that original has drop_out...
+    # but we NEED to beat drop_out....
+
+    close_log()
