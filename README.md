@@ -2,6 +2,7 @@
 Implementation of Adversarial learning on several neural networks
 
 RNN/LSTM model is implemented by Isaac Caswell
+
 CNN model is implemented by Allen Nie (originally from CNN_Sentence by Yoon Kim)
 
 Also contributions are from Onkur Sen, our project partner as well.
